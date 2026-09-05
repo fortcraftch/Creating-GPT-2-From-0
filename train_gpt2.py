@@ -186,26 +186,63 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device_type):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------- #
 
 import tiktoken
 import numpy as np
 import time 
 
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, split):
         self.B = B
         self.T = T
+        assert split in {'train', 'val'}
 
-        with open("input.txt", "r") as f:
-            text = f.read()
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        print(f"found {len(shards)} shards for split {split}")
+        self.reset()
 
-        self.current_position = 0
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T 
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -216,85 +253,214 @@ class DataLoaderLite:
         self.current_position += B * T 
         # if loading the next batch would be out of bounds, advance to next shard
         if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T
         return x, y
 
+
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------- #
+# helper function for HellaSwag eval
+# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
+
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------------------------- #
+
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print ("using device:", device)
 
-torch.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
-    
-train_loader = DataLoaderLite(B=8, T=1024)
+total_batch_size = 524288 # 2**19 ~0.5M tokens per batch
+B = 8 # micro batch size
+T = 1024 # Sequence length
+assert total_batch_size % (B*T) == 0
+grad_accumulation_steps = total_batch_size // (B*T)
+print(f"total_batch_size: {total_batch_size}")
+print(f"grad_accumulation_steps: {grad_accumulation_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T, split='train')
+val_loader = DataLoaderLite(B=B, T=T, split='val')
 
 # Optimize training time by using less precision on training, using TF32 instead of FP32
 torch.set_float32_matmul_precision('high') # use TF32 on matmul (10 bit of mantisa instead of 23 bits in FP32) 
 
-# Get logits
+# Create model
 # model = GPT.from_pretrained("gpt2")
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-model = torch.compile(model) # compile the model for faster training
-# logits, loss = model(x, y)
+use_compile = False
+if use_compile:
+    model = torch.compile(model) # compile the model for faster training
 
-# Optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4)
-for i in range(50):
-    t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16): # autocast to BF16 for faster training
-        logits, loss = model(x, y)
-    loss.backward()
-    optimizer.step()
-    torch.cuda.synchronize() # wait for all kernels in all streams on a CUDA device to complete
-    t1 = time.time()
-    dt = (t1 - t0)*1000
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {i}, loss: {loss.item()}, time: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmpup_steps = 715
+max_steps = 19073
 
-
-import sys; sys.exit(0)
-
-# prefix tokens
 num_return_sequences = 5
 max_length = 30
 
-model.eval()
-
 enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to(device)
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # Forward passes
-    with torch.no_grad():
-        logits = model(x)[0] # (B, T, vocab_size)
-        # take the logits at the last position
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1)
-        # do top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probabilities
-        # note: multinomial does not demand the input to sum to 1
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append to the sequence
-        x = torch.cat((x, xcol), dim=1)
+# Learning rate schedule
+def get_lr(it):
+    # 1. linear warmup for the first `warmpup_steps` steps
+    if it < warmpup_steps:
+        return max_lr * it / warmpup_steps
+    # 2. if it > lr_decay_iter, return min_lr
+    if it > max_steps:
+        return min_lr
+    # 3. in between, use cosine decay down to min_lr
+    decay_steps = max_steps - warmpup_steps
+    decay_ratio = (it - warmpup_steps) / decay_steps
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1.0 and ends at 0.0
+    return max_lr + coeff * (min_lr - max_lr)
 
-# Print generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+# Optimizer
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+
+# create the log directory we will write checkpoints to and log to
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f: # open for writing to clear the file
+    pass
+
+for step in range(max_steps):
+    t0 = time.time()
+    last_step = step == max_steps - 1
+
+    # Eval loop
+    if step % 250 == 0 or last_step:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_acum = 0.0
+            val_loss_steps = 10
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16): # autocast to BF16 for faster training
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps # scale the loss to account for gradient accumulation
+                val_loss_acum += loss.detach()
+            print(f"step {step}: val loss {val_loss_acum:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"step {step}: val loss {val_loss_acum:.4f}\n")
+            if step > 0 and (step % 2000 == 0 or last_step):
+                # optionally write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': model.state_dict(),
+                    'config': model.config,
+                    'step': step,
+                    'val_loss': val_loss_acum
+                }
+                torch.save(checkpoint, checkpoint_path)
+
+
+        
+    # once in a while evaluate hellaswag
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # render the example into tokens and labels
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        acc_norm = num_correct_norm / num_total
+        print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} hella {acc_norm:.4f}\n")
+
+
+    # once in a while generate from the model (except step 0, which is noise)
+    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+        model.eval()
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42)
+        while xgen.size(1) < max_length:
+            # Forward passes
+            with torch.no_grad():
+                logits = model(xgen)[0] # (B, T, vocab_size)
+                # take the logits at the last position
+                logits = logits[:, -1, :] # (B, vocab_size)
+                # get the probabilities
+                probs = F.softmax(logits, dim=-1)
+                # do top-k sampling of 50 (huggingface pipeline default)
+                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                # select a token from the top-k probabilities
+                # note: multinomial does not demand the input to sum to 1
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                # gather the corresponding indices
+                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                # append to the sequence
+                xgen = torch.cat((xgen, xcol), dim=1)
+        
+        # Print generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(">", decoded)
+
+
+    # Train loop
+    model.train()
+    optimizer.zero_grad()
+    loss_accum = 0.0
+    for micro_step in range(grad_accumulation_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16): # autocast to BF16 for faster training
+            logits, loss = model(x, y)
+        loss = loss / grad_accumulation_steps # scale the loss to account for gradient accumulation
+        loss_accum += loss.detach()
+        loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clip gradients to avoid exploding gradients
+    # determine and set learning rate for this step
+    lr = get_lr(step) 
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    optimizer.step()
+    torch.cuda.synchronize() # wait for all kernels in all streams on a CUDA device to complete
+    t1 = time.time()
+    dt = t1 - t0
+    tokens_processed = train_loader.B * train_loader.T * grad_accumulation_steps
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {step}, loss: {loss_accum:.4f}, norm: {norm:.4f}, lr: {lr:.6f}, time: {dt:.2f} s, tokens/sec: {tokens_per_sec:.2f}")
+    with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum:.6f}\n")
+
