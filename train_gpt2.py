@@ -47,7 +47,10 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # flash attention (materializes the large (T,T) matrix for all the queries and keys) 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -187,6 +190,7 @@ class GPT(nn.Module):
 
 import tiktoken
 import numpy as np
+import time 
 
 class DataLoaderLite:
     def __init__(self, B, T):
@@ -224,24 +228,34 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
     
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=8, T=1024)
+
+# Optimize training time by using less precision on training, using TF32 instead of FP32
+torch.set_float32_matmul_precision('high') # use TF32 on matmul (10 bit of mantisa instead of 23 bits in FP32) 
 
 # Get logits
 # model = GPT.from_pretrained("gpt2")
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+model = torch.compile(model) # compile the model for faster training
 # logits, loss = model(x, y)
 
 # Optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16): # autocast to BF16 for faster training
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize() # wait for all kernels in all streams on a CUDA device to complete
+    t1 = time.time()
+    dt = (t1 - t0)*1000
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i}, loss: {loss.item()}, time: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
 
 import sys; sys.exit(0)
