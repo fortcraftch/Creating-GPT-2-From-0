@@ -297,15 +297,40 @@ grad_accumulation_steps = total_batch_size // (B*T)
 print(f"total_batch_size: {total_batch_size}")
 print(f"grad_accumulation_steps: {grad_accumulation_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, split='train')
-val_loader = DataLoaderLite(B=B, T=T, split='val')
-
 # Optimize training time by using less precision on training, using TF32 instead of FP32
 torch.set_float32_matmul_precision('high') # use TF32 on matmul (10 bit of mantisa instead of 23 bits in FP32) 
 
+# ---------------------------------------------------------
+# Checkpoint / resume
+# ---------------------------------------------------------
+
+resume_from = None
+# Example:
+# resume_from = "log/model_02000.pt"
+
+# ---------------------------------------------------------
 # Create model
-# model = GPT.from_pretrained("gpt2")
-model = GPT(GPTConfig(vocab_size=50304))
+# ---------------------------------------------------------
+
+if resume_from is not None:
+    print(f"Loading checkpoint: {resume_from}")
+
+    checkpoint = torch.load(
+        resume_from,
+        map_location=device,
+        weights_only=False
+    )
+
+    config = GPTConfig(**checkpoint["config"])
+    model = GPT(config)
+    model.load_state_dict(checkpoint["model"])
+
+    start_step = checkpoint["step"] + 1
+
+else:
+    model = GPT(GPTConfig(vocab_size=50304))
+    start_step = 0
+
 model.to(device)
 use_compile = False
 if use_compile:
@@ -317,9 +342,25 @@ warmpup_steps = 715
 max_steps = 19073
 
 num_return_sequences = 5
-max_length = 30
+max_length = 32
 
 enc = tiktoken.get_encoding("gpt2")
+
+train_loader = DataLoaderLite(B=B, T=T, split='train')
+val_loader = DataLoaderLite(B=B, T=T, split='val')
+
+if resume_from is not None:
+    train_loader.current_shard = checkpoint["train_shard"]
+    train_loader.tokens = load_tokens(
+        train_loader.shards[train_loader.current_shard]
+    )
+    train_loader.current_position = checkpoint["train_position"]
+
+    print(
+        f"Resuming data from shard "
+        f"{train_loader.current_shard}, "
+        f"position {train_loader.current_position}"
+    )
 
 # Learning rate schedule
 def get_lr(it):
@@ -338,15 +379,19 @@ def get_lr(it):
 
 # Optimizer
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+if resume_from is not None:
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    print(f"Resuming from step {start_step}")
 
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: # open for writing to clear the file
-    pass
+if resume_from is None:
+    with open(log_file, "w") as f:
+        pass
 
-for step in range(max_steps):
+for step in range(start_step, max_steps):
     t0 = time.time()
     last_step = step == max_steps - 1
 
@@ -367,17 +412,23 @@ for step in range(max_steps):
             print(f"step {step}: val loss {val_loss_acum:.4f}")
             with open(log_file, "a") as f:
                 f.write(f"step {step}: val loss {val_loss_acum:.4f}\n")
-            if step > 0 and (step % 2000 == 0 or last_step):
+            if step > 0 and (step % 250 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                checkpoint = {
-                    'model': model.state_dict(),
-                    'config': model.config,
-                    'step': step,
-                    'val_loss': val_loss_acum
-                }
-                torch.save(checkpoint, checkpoint_path)
+                checkpoint_model = model._orig_mod if hasattr(model, "_orig_mod") else model
 
+                checkpoint = {
+                    "model": checkpoint_model.state_dict(),
+                    "config": vars(checkpoint_model.config),
+                    "optimizer": optimizer.state_dict(),
+                    "step": step,
+                    "val_loss": val_loss_acum.item(),
+                    "train_shard": train_loader.current_shard,
+                    "train_position": train_loader.current_position,
+                }
+
+                torch.save(checkpoint, checkpoint_path)
+                print(f"saved checkpoint: {checkpoint_path}")
 
         
     # once in a while evaluate hellaswag
@@ -462,5 +513,5 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / dt
     print(f"step {step}, loss: {loss_accum:.4f}, norm: {norm:.4f}, lr: {lr:.6f}, time: {dt:.2f} s, tokens/sec: {tokens_per_sec:.2f}")
     with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum:.6f}\n")
+            f.write(f"step {step}, loss: {loss_accum:.4f}, norm: {norm:.4f}, lr: {lr:.6f}, time: {dt:.2f} s, tokens/sec: {tokens_per_sec:.2f}\n")
 
