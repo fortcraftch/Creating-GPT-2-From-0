@@ -304,8 +304,9 @@ torch.set_float32_matmul_precision('high') # use TF32 on matmul (10 bit of manti
 # Checkpoint / resume
 # ---------------------------------------------------------
 
-resume_from = None
+resume_from = "log/model_00750.pt"
 # Example:
+# resume_from = None
 # resume_from = "log/model_02000.pt"
 
 # ---------------------------------------------------------
@@ -338,7 +339,7 @@ if use_compile:
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmpup_steps = 715
+warmup_steps = 715
 max_steps = 19073
 
 num_return_sequences = 5
@@ -364,18 +365,17 @@ if resume_from is not None:
 
 # Learning rate schedule
 def get_lr(it):
-    # 1. linear warmup for the first `warmpup_steps` steps
-    if it < warmpup_steps:
-        return max_lr * it / warmpup_steps
-    # 2. if it > lr_decay_iter, return min_lr
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
     if it > max_steps:
         return min_lr
-    # 3. in between, use cosine decay down to min_lr
-    decay_steps = max_steps - warmpup_steps
-    decay_ratio = (it - warmpup_steps) / decay_steps
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
     assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1.0 and ends at 0.0
-    return max_lr + coeff * (min_lr - max_lr)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
 
 # Optimizer
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
