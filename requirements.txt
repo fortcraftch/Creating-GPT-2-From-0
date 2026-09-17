@@ -6,3 +6,4 @@ datasets
 huggingface_hub
 numpy
 tqdm
+matplotlib

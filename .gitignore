@@ -19,6 +19,8 @@ hellaswag/
 
 # Local dataset shards
 edu_fineweb10B/
+plots/
+results/
 
 # Training outputs
 log/
