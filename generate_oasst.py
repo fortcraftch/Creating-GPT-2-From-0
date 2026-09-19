@@ -2,9 +2,9 @@
 Interactive generation for an OASST1-fine-tuned GPT-2 checkpoint.
 
 Examples:
-    python generate_oasst.py --checkpoint log/oasst/model_best.pt
-    python generate_oasst.py --checkpoint log/oasst/model_best.pt --prompt "Explain quantum entanglement simply."
-    python generate_oasst.py --checkpoint log/oasst/model_best.pt --temperature 0.7 --top-k 40
+    python generate_oasst.py --checkpoint models/model_best.pt
+    python generate_oasst.py --checkpoint models/model_best.pt --prompt "Explain quantum entanglement simply."
+    python generate_oasst.py --checkpoint models/model_best.pt --temperature 0.7 --top-k 40
 
 Interactive mode accepts one prompt per line. Type 'exit' or 'quit' to stop.
 """

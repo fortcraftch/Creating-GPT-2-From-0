@@ -18,7 +18,7 @@ The generated checkpoint is compatible with the project's generate.py/eval.py:
     }
 
 Recommended first run:
-    python finetune_oasst.py --checkpoint gpt2Base.pt --steps 2000
+    python finetune_oasst.py --checkpoint models/gpt2Base.pt --steps 2000
 
 Resume:
     python finetune_oasst.py --checkpoint log/oasst/model_2000.pt --resume
@@ -237,12 +237,12 @@ def encode_conversation(messages, enc, block_size):
     for msg in messages:
         if msg["role"] == "prompter":
             prefix = enc.encode(SPECIAL_USER)
-            text_tokens = enc.encode(msg["text"].strip() + "\n")
+            text_tokens = enc.encode(msg["text"].strip() + "\n", disallowed_special=())
             token_ids.extend(prefix + text_tokens)
             loss_mask.extend([0] * (len(prefix) + len(text_tokens)))
         else:
             prefix = enc.encode(SPECIAL_ASSISTANT)
-            text_tokens = enc.encode(msg["text"].strip())
+            text_tokens = enc.encode(msg["text"].strip(), disallowed_special=())
             part = prefix + text_tokens + [eot]
             token_ids.extend(part)
             loss_mask.extend([0] * len(prefix) + [1] * (len(text_tokens) + 1))
@@ -410,12 +410,17 @@ class ShardLoader:
 # -----------------------------------------------------------------------------
 
 def load_checkpoint(path, device):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
     if "model" not in ckpt or "config" not in ckpt:
         raise ValueError("Checkpoint must contain 'model' and 'config'.")
+
     config = GPTConfig(**ckpt["config"])
+
     model = GPT(config)
     model.load_state_dict(ckpt["model"])
+    model.to(device)
+
     return model, config, ckpt
 
 
@@ -575,8 +580,8 @@ def parse_args():
     p.add_argument("--out-dir", default="log/oasst")
     p.add_argument("--block-size", type=int, default=1024)
     p.add_argument("--steps", type=int, default=2000)
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--grad-accum", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--grad-accum", type=int, default=8)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--min-lr", type=float, default=5e-6)
     p.add_argument("--warmup-steps", type=int, default=100)

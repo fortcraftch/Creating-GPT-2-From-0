@@ -21,6 +21,7 @@ hellaswag/
 edu_fineweb10B/
 plots/
 results/
+data/
 
 # Training outputs
 log/
